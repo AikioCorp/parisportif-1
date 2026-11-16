@@ -1,6 +1,40 @@
 import ExcelJS from "exceljs";
 import { readRecordReference } from "@/lib/record-reference";
 import { buildReportFilename } from "@/lib/report-periods";
+import { addNativeCharts, type NativeChart } from "./report-charts";
+
+function uniqueSafeSheetName(
+  wb: ExcelJS.Workbook,
+  rawName: string,
+): string {
+  const cleaned = rawName.replace(/[\\/?*[\]:]/g, " ").replace(/\s+/g, " ").trim();
+  const base = cleaned.slice(0, 31) || "Feuille";
+  if (!wb.getWorksheet(base)) return base;
+  for (let i = 2; i < 100; i++) {
+    const suffix = ` (${i})`;
+    const candidate = `${base.slice(0, 31 - suffix.length)}${suffix}`;
+    if (!wb.getWorksheet(candidate)) return candidate;
+  }
+  return base;
+}
+
+function applyPrintablePageSetup(ws: ExcelJS.Worksheet) {
+  ws.pageSetup = {
+    orientation: "landscape",
+    paperSize: 9,
+    fitToPage: true,
+    fitToWidth: 1,
+    fitToHeight: 0,
+    margins: {
+      left: 0.3,
+      right: 0.3,
+      top: 0.4,
+      bottom: 0.4,
+      header: 0.2,
+      footer: 0.2,
+    },
+  };
+}
 
 export interface ReportOperatorMeta {
   key: string; // Uppercase normalized key (e.g. "1XBET")
@@ -500,16 +534,16 @@ export interface ExportWeeklyReportParams {
   chartImageBase64?: string | null;
 }
 
-export async function buildWeeklyOfficialWorkbook({
+async function buildWeeklyOfficialWorkbookInternal({
   startDate,
   endDate,
   activeOperatorNames,
   bets,
   transactions,
   illegals,
-  chartImageBase64,
-}: ExportWeeklyReportParams): Promise<ExcelJS.Workbook> {
+}: ExportWeeklyReportParams): Promise<{ wb: ExcelJS.Workbook; charts: NativeChart[] }> {
   const wb = new ExcelJS.Workbook();
+  const charts: NativeChart[] = [];
   wb.creator = "OPEN - Plateforme de Contrôle";
   wb.created = new Date();
   wb.calcProperties.fullCalcOnLoad = true;
@@ -541,6 +575,7 @@ export async function buildWeeklyOfficialWorkbook({
   // 1. FEUILLE PARI (classée par blocs d'opérateurs)
   // ============================================================================
   const wsPari = wb.addWorksheet("PARI");
+  applyPrintablePageSetup(wsPari);
   wsPari.mergeCells("C1:I1");
   const pariTitle = wsPari.getCell("C1");
   pariTitle.value = `RAPPORT DE LA SEMAINE ${titlePeriod}`;
@@ -730,24 +765,39 @@ export async function buildWeeklyOfficialWorkbook({
           }
         : grandBetTotal;
     styleHeaderCell(grandCell, "FFBFBFBF", 12);
-  }
 
-  if (chartImageBase64) {
-    const cleanBase64 = chartImageBase64.replace(/^data:image\/\w+;base64,/, "");
-    const imageId = wb.addImage({
-      base64: cleanBase64,
-      extension: "png",
-    });
-    wsPari.addImage(imageId, {
-      tl: { col: 1, row: pariRowIdx + 1 },
-      ext: { width: 760, height: 360 },
-    });
+    if (matrixLastDataRow >= matrixFirstDataRow) {
+      charts.push({
+        sheetId: 1,
+        title: "Matrice Journalière des Tests par Opérateur Actif",
+        kind: "bar",
+        row: pariRowIdx + 1,
+        column: 1,
+        width: Math.max(7, reportOperators.length + 3),
+        height: 18,
+        unit: "Tests",
+        categories: {
+          formula: `PARI!$B$${matrixFirstDataRow}:$B$${matrixLastDataRow}`,
+          values: betMatrix.map((m) => m.label),
+        },
+        series: reportOperators.map((op, idx) => {
+          const colLetter = wsPari.getColumn(idx + 3).letter;
+          return {
+            name: op.displayName,
+            formula: `PARI!$${colLetter}$${matrixFirstDataRow}:$${colLetter}$${matrixLastDataRow}`,
+            values: betMatrix.map((m) => m.counts[op.key] || 0),
+            color: op.chartColor.replace(/^#/, ""),
+          };
+        }),
+      });
+    }
   }
 
   // ============================================================================
   // 2. FEUILLE DEPOT-RETRAIT (classée par blocs d'opérateurs)
   // ============================================================================
   const wsTx = wb.addWorksheet("DEPOT-RETRAIT");
+  applyPrintablePageSetup(wsTx);
   wsTx.mergeCells("C1:K1");
   const txTitle = wsTx.getCell("C1");
   txTitle.value = `RAPPORT DE LA SEMAINE ${titlePeriod}`;
@@ -981,6 +1031,44 @@ export async function buildWeeklyOfficialWorkbook({
       styleHeaderCell(rCell, "FFF2F2F2", 12);
       rCell.alignment = { vertical: "middle", horizontal: "right" };
     });
+
+    if (matrixLastRow >= matrixFirstRow) {
+      const txSeries: NativeChart["series"] = [];
+      reportOperators.forEach((op, idx) => {
+        const colStart = 3 + idx * 2;
+        const dLetter = wsTx.getColumn(colStart).letter;
+        const rLetter = wsTx.getColumn(colStart + 1).letter;
+        const baseColor = op.chartColor.replace(/^#/, "");
+        txSeries.push({
+          name: `${op.displayName} (Dépôts)`,
+          formula: `'DEPOT-RETRAIT'!$${dLetter}$${matrixFirstRow}:$${dLetter}$${matrixLastRow}`,
+          values: txMatrix.map((m) => m.depots[op.key] || 0),
+          color: baseColor,
+        });
+        txSeries.push({
+          name: `${op.displayName} (Retraits)`,
+          formula: `'DEPOT-RETRAIT'!$${rLetter}$${matrixFirstRow}:$${rLetter}$${matrixLastRow}`,
+          values: txMatrix.map((m) => m.retraits[op.key] || 0),
+          color: "E52329",
+        });
+      });
+
+      charts.push({
+        sheetId: 2,
+        title: "Matrice Récapitulative Dépôts & Retraits par Opérateur Actif (F CFA)",
+        kind: "bar",
+        row: txRowIdx + 1,
+        column: 1,
+        width: Math.max(8, reportOperators.length * 2 + 2),
+        height: 18,
+        unit: "FCFA",
+        categories: {
+          formula: `'DEPOT-RETRAIT'!$B$${matrixFirstRow}:$B$${matrixLastRow}`,
+          values: txMatrix.map((m) => m.label),
+        },
+        series: txSeries,
+      });
+    }
   }
 
   // ============================================================================
@@ -1072,15 +1160,169 @@ export async function buildWeeklyOfficialWorkbook({
   illTotalRow.getCell(7).alignment = { vertical: "middle", horizontal: "right" };
   for (let c = 8; c <= 11; c++) styleHeaderCell(illTotalRow.getCell(c), "FFBFBFBF", 12);
 
+  // ============================================================================
+  // 4. ONGLETS IMPRIMABLES PAR OPÉRATEUR (Tests & Dépôts-Retraits uniquement)
+  // ============================================================================
+  const betGroupMap = new Map(betGroups.map((g) => [g.meta.key, g]));
+  const txGroupMap = new Map(txGroups.map((g) => [g.meta.key, g]));
+
+  reportOperators.forEach((op) => {
+    // 4a. Onglet Test <Opérateur>
+    const opBets = betGroupMap.get(op.key)?.items || [];
+    const wsOpTest = wb.addWorksheet(
+      uniqueSafeSheetName(wb, `Test ${op.displayName}`),
+    );
+    applyPrintablePageSetup(wsOpTest);
+    wsOpTest.mergeCells("A1:I1");
+    const opTestTitle = wsOpTest.getCell("A1");
+    opTestTitle.value = `RAPPORT DE LA PÉRIODE ${titlePeriod} — OPÉRATEUR : ${op.label} (TESTS)`;
+    opTestTitle.font = { name: "Cambria", size: 13, bold: true, color: { argb: "FF000000" } };
+    opTestTitle.alignment = { vertical: "middle", horizontal: "center" };
+    wsOpTest.getRow(1).height = 24;
+
+    pariWidths.forEach((w, idx) => {
+      wsOpTest.getColumn(idx + 1).width = w;
+    });
+    const opTestHeader = wsOpTest.getRow(2);
+    opTestHeader.height = 36;
+    opTestHeader.values = pariHeaders;
+    pariHeaders.forEach((_, i) => styleHeaderCell(opTestHeader.getCell(i + 1), op.fill, 12));
+
+    let rIdx = 3;
+    const startRow = rIdx;
+    let opBetTotal = 0;
+    opBets.forEach((b, idx) => {
+      const row = wsOpTest.getRow(rIdx++);
+      row.height = 19;
+      const amt = Number(b.amount_fcfa) || 0;
+      opBetTotal += amt;
+      const ref = readRecordReference(b).reference || b.notes || "";
+      row.getCell(1).value = idx + 1;
+      row.getCell(2).value = b.date ? new Date(`${b.date}T00:00:00`).toLocaleDateString("fr-FR") : "";
+      row.getCell(3).value = op.displayName || b.operator || "";
+      row.getCell(4).value = b.support || "";
+      row.getCell(5).value = b.bet_type || "";
+      row.getCell(6).value = amt;
+      row.getCell(6).numFmt = "#,##0";
+      row.getCell(7).value = formatExcelHour(b.time);
+      row.getCell(8).value = b.phone ? String(b.phone) : "";
+      row.getCell(9).value = ref ? String(ref) : "";
+      [1, 2, 3, 4, 5, 7, 8, 9].forEach((c) => styleDataCell(row.getCell(c), "center", c === 3, 12));
+      styleDataCell(row.getCell(6), "right", false, 12);
+    });
+    const endRow = rIdx - 1;
+    const totalRow = wsOpTest.getRow(rIdx++);
+    totalRow.height = 22;
+    totalRow.getCell(5).value = "TOTAL";
+    styleHeaderCell(totalRow.getCell(5), "FFF2F2F2", 12);
+    totalRow.getCell(6).value =
+      endRow >= startRow
+        ? { formula: `SUM(F${startRow}:F${endRow})`, result: opBetTotal }
+        : 0;
+    totalRow.getCell(6).numFmt = "#,##0";
+    styleHeaderCell(totalRow.getCell(6), "FFF2F2F2", 12);
+    totalRow.getCell(6).alignment = { vertical: "middle", horizontal: "right" };
+
+    // 4b. Onglet Dépôt-Retrait <Opérateur>
+    const opTxs = txGroupMap.get(op.key)?.items || [];
+    const wsOpTx = wb.addWorksheet(
+      uniqueSafeSheetName(wb, `Dépôt-Retrait ${op.displayName}`),
+    );
+    applyPrintablePageSetup(wsOpTx);
+    wsOpTx.mergeCells("A1:K1");
+    const opTxTitle = wsOpTx.getCell("A1");
+    opTxTitle.value = `RAPPORT DE LA PÉRIODE ${titlePeriod} — OPÉRATEUR : ${op.label} (DÉPÔTS & RETRAITS)`;
+    opTxTitle.font = { name: "Cambria", size: 13, bold: true, color: { argb: "FF000000" } };
+    opTxTitle.alignment = { vertical: "middle", horizontal: "center" };
+    wsOpTx.getRow(1).height = 24;
+
+    txWidths.forEach((w, idx) => {
+      wsOpTx.getColumn(idx + 1).width = w;
+    });
+    const opTxHeader = wsOpTx.getRow(2);
+    opTxHeader.height = 36;
+    opTxHeader.values = txHeaders;
+    txHeaders.forEach((_, i) => styleHeaderCell(opTxHeader.getCell(i + 1), op.fill, 12));
+
+    let txRIdx = 3;
+    const txStartRow = txRIdx;
+    let opDepotTotal = 0;
+    let opRetraitTotal = 0;
+    opTxs.forEach((t, idx) => {
+      const row = wsOpTx.getRow(txRIdx++);
+      row.height = 19;
+      const amt = Number(t.amount_fcfa) || 0;
+      const tNorm = String(t.type || "").toLowerCase();
+      if (tNorm.includes("retrait")) opRetraitTotal += amt;
+      else opDepotTotal += amt;
+      const ref = readRecordReference(t).reference || t.notes || "";
+      row.getCell(1).value = idx + 1;
+      row.getCell(2).value = t.date ? new Date(`${t.date}T00:00:00`).toLocaleDateString("fr-FR") : "";
+      row.getCell(3).value = op.displayName || t.operator || "";
+      row.getCell(4).value = t.platform || t.support || "";
+      row.getCell(5).value = t.payment_operator || "";
+      row.getCell(6).value = tNorm.includes("retrait") ? "Retrait" : "Dépôt";
+      row.getCell(7).value = amt;
+      row.getCell(7).numFmt = "#,##0";
+      row.getCell(8).value = formatExcelHour(t.time);
+      row.getCell(9).value = t.phone ? String(t.phone) : "";
+      row.getCell(10).value = ref ? String(ref) : "";
+      row.getCell(11).value = resolveProofDisplay(t);
+      [1, 2, 3, 4, 5, 6, 8, 9, 10, 11].forEach((c) => styleDataCell(row.getCell(c), "center", c === 3, 12));
+      styleDataCell(row.getCell(7), "right", false, 12);
+    });
+    const txEndRow = txRIdx - 1;
+    const dRow = wsOpTx.getRow(txRIdx++);
+    dRow.height = 22;
+    dRow.getCell(6).value = "TOTAL DEPOT";
+    styleHeaderCell(dRow.getCell(6), "FFF2F2F2", 12);
+    dRow.getCell(7).value =
+      txEndRow >= txStartRow
+        ? { formula: `SUMIF(F${txStartRow}:F${txEndRow},"Dépôt",G${txStartRow}:G${txEndRow})`, result: opDepotTotal }
+        : 0;
+    dRow.getCell(7).numFmt = "#,##0";
+    styleHeaderCell(dRow.getCell(7), "FFF2F2F2", 12);
+    dRow.getCell(7).alignment = { vertical: "middle", horizontal: "right" };
+
+    const retRow = wsOpTx.getRow(txRIdx++);
+    retRow.height = 22;
+    retRow.getCell(6).value = "TOTAL RETRAIT";
+    styleHeaderCell(retRow.getCell(6), "FFF2F2F2", 12);
+    retRow.getCell(7).value =
+      txEndRow >= txStartRow
+        ? { formula: `SUMIF(F${txStartRow}:F${txEndRow},"Retrait",G${txStartRow}:G${txEndRow})`, result: opRetraitTotal }
+        : 0;
+    retRow.getCell(7).numFmt = "#,##0";
+    styleHeaderCell(retRow.getCell(7), "FFF2F2F2", 12);
+    retRow.getCell(7).alignment = { vertical: "middle", horizontal: "right" };
+  });
+
+  return { wb, charts };
+}
+
+export async function buildWeeklyOfficialWorkbook(
+  params: ExportWeeklyReportParams,
+): Promise<ExcelJS.Workbook> {
+  const { wb } = await buildWeeklyOfficialWorkbookInternal(params);
   return wb;
+}
+
+export async function buildWeeklyOfficialWorkbookBytes(
+  params: ExportWeeklyReportParams,
+): Promise<Uint8Array> {
+  const { wb, charts } = await buildWeeklyOfficialWorkbookInternal(params);
+  const rawBuffer = await wb.xlsx.writeBuffer();
+  if (charts.length === 0) {
+    return new Uint8Array(rawBuffer as ArrayBuffer);
+  }
+  return addNativeCharts(new Uint8Array(rawBuffer as ArrayBuffer), charts);
 }
 
 export async function exportWeeklyOfficialReport(
   params: ExportWeeklyReportParams,
 ) {
-  const wb = await buildWeeklyOfficialWorkbook(params);
-  const buffer = await wb.xlsx.writeBuffer();
-  const blob = new Blob([buffer], {
+  const bytes = await buildWeeklyOfficialWorkbookBytes(params);
+  const blob = new Blob([bytes as unknown as BlobPart], {
     type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   });
   const url = URL.createObjectURL(blob);

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
+import JSZip from "jszip";
 import {
   buildWeeklyOfficialWorkbook,
+  buildWeeklyOfficialWorkbookBytes,
   formatExcelHour,
   normalizeOperatorKey,
 } from "./weekly-report-export";
@@ -278,5 +280,53 @@ describe("weekly-report-export", () => {
     expect(wsTx.getCell(`C${txMatrixHeaderRow}`).value).toBe("1XBET");
     expect(wsTx.getCell(`C${txMatrixHeaderRow + 1}`).value).toBe("DEPOTS");
     expect(wsTx.getCell(`D${txMatrixHeaderRow + 1}`).value).toBe("RETRAITS");
+
+    // Onglets imprimables par opérateur (Tests et Dépôts-Retraits uniquement)
+    const wsTest1x = wb.getWorksheet("Test 1xBet")!;
+    const wsTx1x = wb.getWorksheet("Dépôt-Retrait 1xBet")!;
+    expect(wsTest1x).toBeDefined();
+    expect(wsTx1x).toBeDefined();
+    expect(String(wsTest1x.getCell("A1").value)).toContain("1XBET");
+    expect(String(wsTx1x.getCell("A1").value)).toContain("1XBET");
+    expect(wsTest1x.pageSetup?.orientation).toBe("landscape");
+    expect(wsTx1x.pageSetup?.fitToWidth).toBe(1);
+
+    // Export binaire : graphiques natifs OOXML présents, aucune image PNG embarquée
+    const bytes = await buildWeeklyOfficialWorkbookBytes({
+      startDate: "2026-01-15",
+      endDate: "2026-01-21",
+      activeOperatorNames: ["1xBet", "Bet223", "PremierBet"],
+      bets: [
+        {
+          date: "2026-01-16",
+          time: "15:50",
+          operator: "1xBet",
+          support: "Mobile",
+          bet_type: "Live",
+          amount_fcfa: 1000,
+        },
+      ],
+      transactions: [
+        {
+          date: "2026-01-16",
+          time: "14:05",
+          operator: "1xBet",
+          type: "Dépôt",
+          amount_fcfa: 5000,
+        },
+      ],
+      illegals: [],
+      chartImageBase64: "data:image/png;base64,iVBORw0KGgo=",
+    });
+
+    const zip = await JSZip.loadAsync(bytes);
+    const files = Object.keys(zip.files);
+    expect(files.some((f) => f.startsWith("xl/media/"))).toBe(false);
+    const chart1 = await zip.file("xl/charts/report1.xml")!.async("string");
+    const chart2 = await zip.file("xl/charts/report2.xml")!.async("string");
+    expect(chart1).toContain("Matrice Journalière des Tests par Opérateur Actif");
+    expect(chart2).toContain(
+      "Matrice Récapitulative Dépôts &amp; Retraits par Opérateur Actif (F CFA)",
+    );
   });
 });
