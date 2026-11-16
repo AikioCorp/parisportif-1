@@ -8,7 +8,8 @@ import { toast } from "sonner";
 import { exportStyledExcel } from "@/lib/excel-export";
 import { exportStyledPDF } from "@/lib/pdf-export";
 import { FileText, Download, RefreshCw } from "lucide-react";
-import { useAuditLogs } from "@/hooks/use-data-queries";
+import { useAuditLogs, useUsers } from "@/hooks/use-data-queries";
+import { PERMISSION_LABELS, type Permission } from "@/lib/rbac";
 import { DatePickerCustom } from "@/components/ui/date-picker-custom";
 import {
   TablePaginationFooter,
@@ -45,6 +46,17 @@ function AuditTable() {
 
   // Cache TanStack React Query pour fluidité instantanée
   const { data: rows = [], isLoading, isFetching, refetch } = useAuditLogs(filters);
+  const { data: usersList = [] } = useUsers();
+
+  const userNameById = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const u of usersList as any[]) {
+      if (u?.id) {
+        map[u.id] = u.nom || u.name || u.email || u.id;
+      }
+    }
+    return map;
+  }, [usersList]);
 
   const canExport = true;
   const csv = useMemo(() => {
@@ -64,7 +76,7 @@ function AuditTable() {
       labelAction(r.action),
       labelEntity(r.entity),
       r.entityId || "",
-      summarizeDetails(r.details || {}),
+      summarizeDetails(r.details || {}, userNameById),
     ]);
     return [headers, ...lines]
       .map((l) =>
@@ -110,7 +122,7 @@ function AuditTable() {
       action: labelAction(r.action),
       entity: labelEntity(r.entity),
       entityId: r.entityId || "—",
-      details: summarizeDetails(r.details || {}),
+      details: summarizeDetails(r.details || {}, userNameById),
     }));
 
     try {
@@ -149,7 +161,7 @@ function AuditTable() {
       role: r.user?.role || "—",
       action: labelAction(r.action),
       entity: labelEntity(r.entity),
-      details: summarizeDetails(r.details || {}),
+      details: summarizeDetails(r.details || {}, userNameById),
     }));
 
     try {
@@ -277,9 +289,11 @@ function AuditTable() {
                 <td className="p-2">{r.user?.role || ""}</td>
                 <td className="p-2">{labelAction(r.action)}</td>
                 <td className="p-2">{labelEntity(r.entity)}</td>
-                <td className="p-2">{r.entityId || ""}</td>
+                <td className="p-2 font-mono text-xs text-muted-foreground" title={r.entityId || ""}>
+                  {r.entityId && r.entityId.length > 12 ? `${r.entityId.slice(0, 8)}…` : r.entityId || "—"}
+                </td>
                 <td className="p-2 text-xs">
-                  <DetailsView details={r.details} />
+                  <DetailsView details={r.details} userNameById={userNameById} />
                 </td>
               </tr>
             )) : (
@@ -337,66 +351,211 @@ function labelEntity(e: AuditEntry["entity"]): string {
   }
 }
 
-function summarizeDetails(d: any): string {
-  if (!d) return "";
-  if (d.change && d.from !== undefined && d.to !== undefined) {
-    return `${d.change}: ${d.from} → ${d.to}`;
+const AUDIT_TABLE_LABELS: Record<string, string> = {
+  bets: "Test de pari",
+  transactions: "Dépôt / Retrait",
+  venues: "Salle de jeu",
+  users: "Utilisateur",
+  role_permissions: "Permissions de rôle",
+  illegal_bets: "Pari illégal",
+  illegal_transactions: "Transaction illégale",
+};
+
+const AUDIT_OP_LABELS: Record<string, string> = {
+  INSERT: "Création",
+  UPDATE: "Modification",
+  DELETE: "Suppression",
+};
+
+const AUDIT_STATUS_LABELS: Record<string, string> = {
+  brouillon: "Brouillon",
+  en_attente: "En attente",
+  valide: "Validé",
+  refuse: "Refusé",
+  actif: "Actif",
+  inactif: "Inactif",
+  suspendu: "Suspendu",
+  deleted: "Supprimé",
+};
+
+const AUDIT_KEY_LABELS: Record<string, string> = {
+  op: "Type d'action",
+  table: "Élément concerné",
+  old_status: "Ancien statut",
+  new_status: "Nouveau statut",
+  status: "Statut",
+  validated_by: "Traité par",
+  archived_by: "Archivé par",
+  deleted_by: "Supprimé par",
+  motif: "Motif",
+  reason: "Motif",
+  role: "Rôle",
+  email: "Email",
+  statut: "Statut du compte",
+};
+
+function formatAuditStatus(value: unknown): string {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "—";
+  return AUDIT_STATUS_LABELS[raw] || raw;
+}
+
+function formatAuditValue(
+  key: string,
+  value: unknown,
+  userNameById: Record<string, string> = {},
+): string {
+  if (value === null || value === undefined || value === "") return "—";
+  const str = String(value);
+  if (key === "table") return AUDIT_TABLE_LABELS[str] || str;
+  if (key === "op") return AUDIT_OP_LABELS[str.toUpperCase()] || str;
+  if (key === "old_status" || key === "new_status" || key === "status" || key === "statut") {
+    return formatAuditStatus(str);
   }
-  if (d.action === "suspend" && d.motif) return `Suspension (motif: ${d.motif})`;
-  if (d.motif && d.soft) return `Suppression logique (motif: ${d.motif})`;
-  if (d.permissions) return `Permissions: ${Array.isArray(d.permissions) ? d.permissions.join(", ") : String(d.permissions)}`;
-  if (d.values && d.values.email) return `Email: ${d.values.email}`;
-  if (d.user && d.user.email) return `Utilisateur: ${d.user.email}`;
-  const s = JSON.stringify(d);
+  if (key === "validated_by" || key === "archived_by" || key === "deleted_by" || key === "user_id") {
+    return userNameById[str] || "Système / Admin";
+  }
+  return str;
+}
+
+function formatTriggerLines(
+  d: any,
+  userNameById: Record<string, string> = {},
+): string[] {
+  const lines: string[] = [];
+  const tableLabel = d.table ? AUDIT_TABLE_LABELS[d.table] || d.table : "";
+  const opLabel = d.op ? AUDIT_OP_LABELS[String(d.op).toUpperCase()] || d.op : "";
+
+  if (opLabel || tableLabel) {
+    lines.push([opLabel, tableLabel].filter(Boolean).join(" — "));
+  }
+
+  if (d.old_status !== undefined && d.new_status !== undefined) {
+    const fromLabel = formatAuditStatus(d.old_status);
+    const toLabel = formatAuditStatus(d.new_status);
+    if (d.old_status === d.new_status) {
+      lines.push(`Statut inchangé : ${toLabel}`);
+    } else {
+      lines.push(`Statut : ${fromLabel} → ${toLabel}`);
+    }
+  } else if (d.status !== undefined) {
+    lines.push(`Statut : ${formatAuditStatus(d.status)}`);
+  }
+
+  if (d.validated_by) {
+    lines.push(`Traité par : ${userNameById[d.validated_by] || "Administrateur / Contrôleur"}`);
+  }
+
+  return lines;
+}
+
+function summarizeDetails(
+  d: any,
+  userNameById: Record<string, string> = {},
+): string {
+  if (!d) return "";
+  if (typeof d !== "object") return String(d);
+  if (d.op || d.table) {
+    return formatTriggerLines(d, userNameById).join(" · ");
+  }
+  if (d.change && d.from !== undefined && d.to !== undefined) {
+    return `${AUDIT_KEY_LABELS[d.change] || d.change} : ${formatAuditStatus(d.from)} → ${formatAuditStatus(d.to)}`;
+  }
+  if (d.action === "suspend" && d.motif) return `Suspension (motif : ${d.motif})`;
+  if (d.motif && d.soft) return `Suppression logique (motif : ${d.motif})`;
+  if (d.permissions) {
+    const list = Array.isArray(d.permissions)
+      ? d.permissions.map((p: string) => PERMISSION_LABELS[p as Permission] || p)
+      : [String(d.permissions)];
+    return `Permissions : ${list.join(", ")}`;
+  }
+  if (d.values && d.values.email) return `Email : ${d.values.email}`;
+  if (d.user && d.user.email) return `Utilisateur : ${d.user.email}`;
+  const s = Object.entries(d)
+    .filter(([, v]) => v !== null && v !== undefined && v !== "")
+    .map(([k, v]) => `${AUDIT_KEY_LABELS[k] || k} : ${formatAuditValue(k, v, userNameById)}`)
+    .join(" · ");
   return s.length > 140 ? s.slice(0, 140) + "…" : s;
 }
 
-function DetailsView({ details }: { details: any }) {
+function DetailsView({
+  details,
+  userNameById = {},
+}: {
+  details: any;
+  userNameById?: Record<string, string>;
+}) {
   if (!details || typeof details !== "object") return <span>{String(details || "")}</span>;
+
+  // Journal issu des triggers SQL (op, table, old_status, new_status, validated_by)
+  if (details.op || details.table) {
+    const lines = formatTriggerLines(details, userNameById);
+    if (!lines.length) return <span>—</span>;
+    return (
+      <div className="space-y-0.5 text-slate-700">
+        {lines.map((line, idx) => (
+          <div key={idx} className={idx === 0 ? "font-medium text-slate-900" : "text-slate-600"}>
+            {line}
+          </div>
+        ))}
+      </div>
+    );
+  }
+
   // Cas fréquents
   if (details.change && details.from !== undefined && details.to !== undefined) {
     return (
-      <ul className="list-disc pl-4">
-        <li>
-          <strong>Changement</strong>: {details.change} — {String(details.from)} → {String(details.to)}
-        </li>
-      </ul>
+      <div className="text-slate-700">
+        <span className="font-medium text-slate-900">
+          {AUDIT_KEY_LABELS[details.change] || details.change}
+        </span>{" "}
+        : {formatAuditStatus(details.from)} → {formatAuditStatus(details.to)}
+      </div>
     );
   }
   if (details.action === "suspend" && details.motif) {
     return (
-      <ul className="list-disc pl-4">
-        <li><strong>Suspension</strong></li>
-        <li>Motif: {details.motif}</li>
-      </ul>
+      <div className="space-y-0.5 text-slate-700">
+        <div className="font-medium text-slate-900">Suspension du compte</div>
+        <div>Motif : {details.motif}</div>
+      </div>
     );
   }
   if (details.motif && details.soft) {
     return (
-      <ul className="list-disc pl-4">
-        <li><strong>Suppression logique</strong></li>
-        <li>Motif: {details.motif}</li>
-      </ul>
+      <div className="space-y-0.5 text-slate-700">
+        <div className="font-medium text-slate-900">Suppression logique</div>
+        <div>Motif : {details.motif}</div>
+      </div>
     );
   }
   if (Array.isArray(details.permissions)) {
     return (
-      <ul className="list-disc pl-4">
-        <li><strong>Permissions</strong>:</li>
+      <ul className="list-disc pl-4 text-slate-700">
+        <li className="font-medium text-slate-900">Permissions attribuées :</li>
         {details.permissions.map((p: string) => (
-          <li key={p}>{p}</li>
+          <li key={p}>{PERMISSION_LABELS[p as Permission] || p}</li>
         ))}
       </ul>
     );
   }
-  // Rendu générique key → value
-  const entries = Object.entries(details);
-  if (!entries.length) return <span />;
+
+  // Rendu lisible clé → valeur
+  const entries = Object.entries(details).filter(
+    ([, v]) => v !== null && v !== undefined && v !== "",
+  );
+  if (!entries.length) return <span className="text-muted-foreground">—</span>;
   return (
-    <ul className="list-disc pl-4">
+    <ul className="space-y-0.5 text-slate-700">
       {entries.map(([k, v]) => (
         <li key={k}>
-          <strong>{k}</strong>: {typeof v === "object" ? summarizeDetails(v) : String(v)}
+          <span className="font-medium text-slate-900">
+            {AUDIT_KEY_LABELS[k] || k}
+          </span>
+          {" : "}
+          {typeof v === "object"
+            ? summarizeDetails(v, userNameById)
+            : formatAuditValue(k, v, userNameById)}
         </li>
       ))}
     </ul>
